@@ -30,7 +30,7 @@ const io = new Server(server, {
 });
 
 //TODO: Create this file in the server directory of the project
-process.env.GOOGLE_APPLICATION_CREDENTIALS = "./_pull.json";
+process.env.GOOGLE_APPLICATION_CREDENTIALS = "./pull.json";
 
 const speechClient = new speech.SpeechClient();
 

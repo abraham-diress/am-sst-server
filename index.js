@@ -40,6 +40,7 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     console.log("** user disconnected ** \n");
+    stopRecognitionStream();
   });
 
   socket.on("send_message", (message) => {
@@ -72,6 +73,10 @@ io.on("connection", (socket) => {
   });
 
   function startRecognitionStream(client) {
+    if (recognizeStream) {
+      console.log("Stream already started. Ignoring request.");
+      return; // Early return if a stream is already active
+    }
     console.log("* StartRecognitionStream\n");
     try {
       recognizeStream = speechClient
@@ -99,6 +104,11 @@ io.on("connection", (socket) => {
             stopRecognitionStream();
             startRecognitionStream(client);
             console.log("restarted stream serverside");
+          }
+
+          if (data.results[0] && data.results[0].isFinal) {
+            stopRecognitionStream();
+            setTimeout(() => startRecognitionStream(client), 1000); // Restart with a delay
           }
         });
     } catch (err) {

@@ -1,146 +1,90 @@
 const express = require("express");
 const speech = require("@google-cloud/speech");
-
-//use logger
-const logger = require("morgan");
-
-//use body parser
+const { Translate } = require("@google-cloud/translate").v2;
+const { OpenAI } = require("openai");
 const bodyParser = require("body-parser");
-
-//use corrs
 const cors = require("cors");
-
-const http = require("http");
-const { Server } = require("socket.io");
+const fs = require("fs");
 
 const app = express();
-
 app.use(cors());
-app.use(logger("dev"));
+app.use(bodyParser.json({ limit: "50mb" }));
+app.use(bodyParser.urlencoded({ limit: "50mb", extended: true }));
 
-app.use(bodyParser.json());
+// Load API keys from api-keys.json
+const apiKeyFile = "./api-keys.json";
+const apiKeys = JSON.parse(fs.readFileSync(apiKeyFile));
 
-const server = http.createServer(app);
+const GOOGLE_APPLICATION_CREDENTIALS = "./pull.json";
+const googleCredentials = JSON.parse(
+  fs.readFileSync(GOOGLE_APPLICATION_CREDENTIALS)
+);
 
-const io = new Server(server, {
-  cors: {
-    origin: ["http://localhost:3000", "https://am-sst.vercel.app"],
-    methods: ["GET", "POST"],
-  },
+const speechClient = new speech.SpeechClient({
+  credentials: googleCredentials,
 });
+const translate = new Translate({ credentials: googleCredentials });
+const openai = new OpenAI({ apiKey: apiKeys.OPENAI_API_KEY });
 
-//TODO: Create this file in the server directory of the project
-process.env.GOOGLE_APPLICATION_CREDENTIALS = "./pull.json";
-
-const speechClient = new speech.SpeechClient();
-
-io.on("connection", (socket) => {
-  let recognizeStream = null;
-  console.log("** a user connected - " + socket.id + " **\n");
-
-  socket.on("disconnect", () => {
-    console.log("** user disconnected ** \n");
-    stopRecognitionStream();
-  });
-
-  socket.on("send_message", (message) => {
-    console.log("message: " + message);
-    setTimeout(() => {
-      io.emit("receive_message", "got this message" + message);
-    }, 1000);
-  });
-
-  socket.on("startGoogleCloudStream", function (data) {
-    startRecognitionStream(this, data);
-  });
-
-  socket.on("endGoogleCloudStream", function () {
-    console.log("** ending google cloud stream **\n");
-    stopRecognitionStream();
-  });
-
-  socket.on("send_audio_data", async (audioData) => {
-    io.emit("receive_message", "Got audio data");
-    if (recognizeStream !== null) {
-      try {
-        recognizeStream.write(audioData.audio);
-      } catch (err) {
-        console.log("Error calling google api " + err);
-      }
-    } else {
-      console.log("RecognizeStream is null");
-    }
-  });
-
-  function startRecognitionStream(client) {
-    if (recognizeStream) {
-      console.log("Stream already started. Ignoring request.");
-      return; // Early return if a stream is already active
-    }
-    console.log("* StartRecognitionStream\n");
-    try {
-      recognizeStream = speechClient
-        .streamingRecognize(request)
-        .on("error", console.error)
-        .on("data", (data) => {
-          const result = data.results[0];
-          const isFinal = result.isFinal;
-
-          const transcription = data.results
-            .map((result) => result.alternatives[0].transcript)
-            .join("\n");
-
-          console.log(`Transcription: `, transcription);
-
-          client.emit("receive_audio_text", {
-            text: transcription,
-            isFinal: isFinal,
-          });
-
-          // if end of utterance, let's restart stream
-          // this is a small hack to keep restarting the stream on the server and keep the connection with Google api
-          // Google api disconects the stream every five minutes
-          if (data.results[0] && data.results[0].isFinal) {
-            stopRecognitionStream();
-            startRecognitionStream(client);
-            console.log("restarted stream serverside");
-          }
-
-          if (data.results[0] && data.results[0].isFinal) {
-            stopRecognitionStream();
-            setTimeout(() => startRecognitionStream(client), 1000); // Restart with a delay
-          }
-        });
-    } catch (err) {
-      console.error("Error streaming google api " + err);
-    }
-  }
-
-  function stopRecognitionStream() {
-    if (recognizeStream) {
-      console.log("* StopRecognitionStream \n");
-      recognizeStream.end();
-    }
-    recognizeStream = null;
-  }
-});
-
-server.listen(8081, () => {
-  console.log("WebSocket server listening on port 8081.");
-});
-
-const encoding = "LINEAR16";
-const sampleRateHertz = 16000;
-const languageCode = "am-ET"; // Amharic language code
-
-const request = {
+const requestConfig = {
   config: {
-    encoding: encoding,
-    sampleRateHertz: sampleRateHertz,
-    languageCode: languageCode,
-    enableAutomaticPunctuation: true,
-    model: "default",
-    useEnhanced: true,
+    languageCode: "am-ET",
   },
-  interimResults: true, // You may want to receive interim results (true) or just final results (false)
 };
+
+app.post("/process_audio", async (req, res) => {
+  const audioContent = req.body.audioContent; // Assuming audioContent is sent as base64 string
+  console.log("Audio content length:", audioContent.length);
+  try {
+    const [response] = await speechClient.recognize({
+      audio: { content: audioContent },
+      config: requestConfig.config,
+    });
+
+    const transcription = response.results
+      .map((result) => result.alternatives[0].transcript)
+      .join("\n");
+
+    console.log(transcription);
+
+    const [translation] = await translate.translate(transcription, "en");
+    const openAIResponse = await queryOpenAI(translation);
+    console.log(openAIResponse);
+    const [finalTranslation] = await translate.translate(openAIResponse, "am");
+
+    // Assuming finalTranslation is an array and you want to send the first item
+    const translationToSend = Array.isArray(finalTranslation)
+      ? finalTranslation[0]
+      : finalTranslation;
+
+    res.json({ translatedText: translationToSend });
+  } catch (error) {
+    console.error("Error processing request:", error);
+    res.status(500).send("Error processing request");
+  }
+});
+
+async function queryOpenAI(prompt) {
+  try {
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [
+        {
+          role: "system",
+          content:
+            "The request comes from a low accuracy Amharic speech to text system...",
+        },
+        { role: "user", content: prompt },
+      ],
+    });
+    return response.choices[0].message.content.trim();
+  } catch (error) {
+    console.error("Error querying OpenAI:", error);
+    throw error;
+  }
+}
+
+const PORT = process.env.PORT || 8081;
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}.`);
+});
